@@ -486,19 +486,21 @@ def punch_out(body: PunchOutRequest):
         now = datetime.now(timezone.utc)
         ts = now.replace(microsecond=0)
 
-    # Find the most recent record whose punch_in <= punched_at and punch_out is null
+    # Find the most recent record whose punch_in <= punched_at
     record = db.attendance_logs.find_one(
         {
             "emp_code": body.emp_code,
             "punch_in": {"$lte": ts},
-            "punch_out": None,
             "status": {"$in": list(PRESENCE_STATUSES)},
         },
         sort=[("punch_in", DESCENDING)],
     )
 
     if not record:
-        raise HTTPException(404, detail="no open punch-in found")
+        raise HTTPException(404, detail="no punch-in found")
+
+    if record.get("punch_out") is not None:
+        raise HTTPException(409, detail="already punched out")
 
     punch_in_dt = _ensure_utc(record["punch_in"])
 
@@ -1081,6 +1083,149 @@ def late_leaderboard(
     return {"month": month, "items": results}
 
 
+def _build_department_trend_pipeline(department: str, from_dt: datetime, to_dt: datetime) -> list[dict]:
+    return [
+        {"$match": {"department": department}},
+        {"$limit": 1},
+        {
+            "$project": {
+                "_id": 0,
+                "dates": [
+                    {"date_dt": from_dt},
+                    {"date_dt": to_dt}
+                ]
+            }
+        },
+        {"$unwind": "$dates"},
+        {"$replaceRoot": {"newRoot": "$dates"}},
+        {"$group": {"_id": "$date_dt"}},
+        {"$project": {"_id": 0, "date_dt": "$_id"}},
+        {
+            "$densify": {
+                "field": "date_dt",
+                "range": {
+                    "step": 1,
+                    "unit": "day",
+                    "bounds": "full"
+                }
+            }
+        },
+        {
+            "$project": {
+                "date": {"$dateToString": {"format": "%Y-%m-%d", "date": "$date_dt"}},
+                "is_working_day": {
+                    "$in": [{"$dayOfWeek": "$date_dt"}, [2, 3, 4, 5, 6]]
+                }
+            }
+        },
+        {
+            "$lookup": {
+                "from": "employees",
+                "pipeline": [
+                    {"$match": {"department": department}},
+                    {"$project": {"_id": 0, "emp_code": 1, "joined_on": 1}}
+                ],
+                "as": "dept_employees"
+            }
+        },
+        {
+            "$lookup": {
+                "from": "attendance_logs",
+                "let": {"cur_date": "$date", "emp_codes": "$dept_employees.emp_code"},
+                "pipeline": [
+                    {
+                        "$match": {
+                            "$expr": {
+                                "$and": [
+                                    {"$eq": ["$date", "$$cur_date"]},
+                                    {"$in": ["$emp_code", "$$emp_codes"]}
+                                ]
+                            }
+                        }
+                    }
+                ],
+                "as": "day_logs"
+            }
+        },
+        {
+            "$project": {
+                "date": 1,
+                "is_working_day": 1,
+                "headcount": {
+                    "$size": {
+                        "$filter": {
+                            "input": "$dept_employees",
+                            "as": "e",
+                            "cond": {"$lte": ["$$e.joined_on", "$date"]}
+                        }
+                    }
+                },
+                "present_count": {
+                    "$sum": {
+                        "$map": {
+                            "input": {
+                                "$filter": {
+                                    "input": "$day_logs",
+                                    "as": "l",
+                                    "cond": {"$in": ["$$l.status", list(PRESENCE_STATUSES)]}
+                                }
+                            },
+                            "as": "pl",
+                            "in": {"$cond": [{"$eq": ["$$pl.half_day", True]}, 0.5, 1.0]}
+                        }
+                    }
+                },
+                "late_count": {
+                    "$size": {
+                        "$filter": {
+                            "input": "$day_logs",
+                            "as": "l",
+                            "cond": {"$gt": [{"$ifNull": ["$$l.late_minutes", 0]}, 0]}
+                        }
+                    }
+                }
+            }
+        },
+        {
+            "$addFields": {
+                "attendance_rate": {
+                    "$cond": [
+                        {"$and": ["$is_working_day", {"$gt": ["$headcount", 0]}]},
+                        {"$divide": ["$present_count", "$headcount"]},
+                        None
+                    ]
+                }
+            }
+        },
+        {"$sort": {"date": 1}},
+        {
+            "$setWindowFields": {
+                "sortBy": {"date": 1},
+                "output": {
+                    "moving_avg_7d": {
+                        "$avg": "$attendance_rate",
+                        "window": {
+                            "documents": [-6, "current"]
+                        }
+                    }
+                }
+            }
+        },
+        {
+            "$project": {
+                "_id": 0,
+                "date": 1,
+                "is_working_day": 1,
+                "headcount": 1,
+                "present_count": 1,
+                "late_count": 1,
+                "attendance_rate": 1,
+                "moving_avg_7d": 1
+            }
+        }
+    ]
+
+
 @app.get("/analytics/departments/{department}/trend")
 def department_trend(
     department: str = Path(...),
@@ -1106,80 +1251,25 @@ def department_trend(
     if (to_date - from_date).days > 92:
         raise HTTPException(422, detail="date range must not exceed 92 days")
 
-    # Get all employees in this department
-    all_employees = list(db.employees.find({"department": department}))
+    from_dt = datetime(from_date.year, from_date.month, from_date.day, tzinfo=timezone.utc)
+    to_dt = datetime(to_date.year, to_date.month, to_date.day, tzinfo=timezone.utc)
 
-    # Get attendance logs for the date range
-    emp_codes = [e["emp_code"] for e in all_employees]
-    logs = list(
-        db.attendance_logs.find(
-            {
-                "emp_code": {"$in": emp_codes},
-                "date": {"$gte": date_from, "$lte": date_to},
-            }
-        )
-    )
+    pipeline = _build_department_trend_pipeline(department, from_dt, to_dt)
+    results = list(db.employees.aggregate(pipeline))
 
-    # Index logs by date
-    logs_by_date: dict[str, list] = {}
-    for log in logs:
-        d = log["date"]
-        if d not in logs_by_date:
-            logs_by_date[d] = []
-        logs_by_date[d].append(log)
-
-    # Generate all calendar days
-    from datetime import date as dt_date
     items = []
-    current = from_date
-    attendance_rates = []  # for moving average
-
-    while current <= to_date:
-        date_str = current.isoformat()
-        is_working_day = current.weekday() < 5
-
-        # Headcount: employees with joined_on <= current day (R9)
-        headcount = sum(1 for e in all_employees if e["joined_on"] <= date_str)
-
-        day_logs = logs_by_date.get(date_str, [])
-
-        # present_count: presence-status records, half_day = 0.5
-        present_count = 0.0
-        late_count = 0
-        for log in day_logs:
-            status = log.get("status", "")
-            if status in PRESENCE_STATUSES:
-                if log.get("half_day", False):
-                    present_count += 0.5
-                else:
-                    present_count += 1.0
-            if log.get("late_minutes", 0) > 0:
-                late_count += 1
-
-        # attendance_rate: only on working days with headcount > 0
-        if is_working_day and headcount > 0:
-            attendance_rate = _round4(present_count / headcount)
-        else:
-            attendance_rate = None
-
-        attendance_rates.append(attendance_rate)
-
-        # moving_avg_7d: mean of non-null attendance_rate in last 7 rows
-        window = attendance_rates[-7:]
-        non_null = [r for r in window if r is not None]
-        moving_avg = _round4(sum(non_null) / len(non_null)) if non_null else None
-
+    for r in results:
+        rate = _round4(r["attendance_rate"]) if r.get("attendance_rate") is not None else None
+        m_avg = _round4(r["moving_avg_7d"]) if r.get("moving_avg_7d") is not None else None
         items.append({
-            "date": date_str,
-            "is_working_day": is_working_day,
-            "headcount": headcount,
-            "present_count": present_count,
-            "late_count": late_count,
-            "attendance_rate": attendance_rate,
-            "moving_avg_7d": moving_avg,
+            "date": r["date"],
+            "is_working_day": r["is_working_day"],
+            "headcount": r["headcount"],
+            "present_count": float(r["present_count"]),
+            "late_count": r["late_count"],
+            "attendance_rate": rate,
+            "moving_avg_7d": m_avg,
         })
-
-        current += timedelta(days=1)
 
     return {"department": department, "items": items}
 
@@ -1353,40 +1443,26 @@ def explain_endpoint(
         if not department or not trend_from or not trend_to:
             raise HTTPException(422, detail="department, from, and to are required")
 
-        emp_codes = [
-            e["emp_code"]
-            for e in db.employees.find({"department": department}, {"emp_code": 1})
-        ]
-        if not emp_codes:
+        dept_exists = db.employees.find_one({"department": department})
+        if not dept_exists:
             raise HTTPException(404, detail="unknown department")
 
-        pipeline = [
-            {
-                "$match": {
-                    "emp_code": {"$in": emp_codes},
-                    "date": {"$gte": trend_from, "$lte": trend_to},
-                }
-            },
-            {
-                "$group": {
-                    "_id": "$date",
-                    "present_count": {
-                        "$sum": {
-                            "$cond": [
-                                {"$in": ["$status", list(PRESENCE_STATUSES)]},
-                                {"$cond": [{"$ifNull": ["$half_day", False]}, 0.5, 1]},
-                                0,
-                            ]
-                        }
-                    },
-                    "late_count": {
-                        "$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}
-                    },
-                }
-            },
-        ]
+        try:
+            from datetime import date as dt_date
+            from_date = dt_date.fromisoformat(trend_from)
+            to_date = dt_date.fromisoformat(trend_to)
+        except ValueError:
+            raise HTTPException(422, detail="invalid date format")
+
+        if to_date < from_date:
+            raise HTTPException(422, detail="'to' must not be before 'from'")
+
+        from_dt = datetime(from_date.year, from_date.month, from_date.day, tzinfo=timezone.utc)
+        to_dt = datetime(to_date.year, to_date.month, to_date.day, tzinfo=timezone.utc)
+
+        pipeline = _build_department_trend_pipeline(department, from_dt, to_dt)
         explain = db.command(
-            "aggregate", "attendance_logs", pipeline=pipeline, explain=True
+            "aggregate", "employees", pipeline=pipeline, explain=True
         )
-        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": _sanitize_explain(explain)}
+        return {"endpoint": endpoint, "collection": "employees", "explain": _sanitize_explain(explain)}
 
